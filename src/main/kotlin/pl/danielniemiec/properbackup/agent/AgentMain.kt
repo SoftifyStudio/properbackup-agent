@@ -9,6 +9,7 @@ import pl.danielniemiec.properbackup.agent.config.ServiceConfig
 import pl.danielniemiec.properbackup.agent.packer.TarGzPacker
 import pl.danielniemiec.properbackup.agent.scanner.DifferentialScanner
 import pl.danielniemiec.properbackup.agent.scanner.MetadataCache
+import pl.danielniemiec.properbackup.agent.scanner.ScanProgressListener
 import pl.danielniemiec.properbackup.agent.transport.BufferUploader
 import pl.danielniemiec.properbackup.agent.logging.RemoteTelemetry
 import pl.danielniemiec.properbackup.agent.ui.AgentPanelUrls
@@ -445,7 +446,7 @@ object AgentMain {
             }
         } finally {
             val pollSec = maxOf(60, global.agent.poll_interval_seconds)
-            telemetry.agentStatus("idle", "Oczekiwanie · następny skan za ok. ${pollSec} s")
+            telemetry.agentStatus("idle", "Oczekiwanie · następny skan za ok. ${pollSec} s", null, null, null)
         }
     }
 
@@ -494,14 +495,25 @@ object AgentMain {
         val cache = MetadataCache(stateDir, svc.service!!)
         val prevState = cache.load()
 
+        val prevTotalFiles = prevState.size.takeIf { it > 0 }
+
         for (pathStr in svc.paths!!) {
             val root = Path.of(pathStr)
             println("  Scanning: $root")
-            telemetry.agentStatus("indexing", "Skan dysku: $pathStr")
+            telemetry.agentStatus("indexing", "Skan dysku: $pathStr", prevTotalFiles, 0, null)
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
+            val lastSendMs = longArrayOf(System.currentTimeMillis())
+            val progressListener = ScanProgressListener { scanned, currentFile ->
+                val now = System.currentTimeMillis()
+                if (now - lastSendMs[0] >= 800) {
+                    lastSendMs[0] = now
+                    telemetry.agentStatus("indexing", "Skan dysku: $pathStr", prevTotalFiles, scanned, currentFile)
+                }
+            }
+
             val result = try {
-                scanner.scan(root, prevState)
+                scanner.scan(root, prevState, progressListener)
             } catch (e: IOException) {
                 System.err.println("  ABORT: ${e.message}")
                 telemetry.log("Agent", -1001, "Scan failed: ${e.message}", "ERROR", mapOf("path" to pathStr))
@@ -518,8 +530,10 @@ object AgentMain {
 
             val pathId = ProperCodec.pathToId(pathStr)
 
+            val totalScanned = result.currentState.size
+
             if (result.changedFiles.isNotEmpty()) {
-                telemetry.agentStatus("uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)")
+                telemetry.agentStatus("uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)", totalScanned, totalScanned, null)
                 result.changedFiles.forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "changed")
                 }
@@ -560,6 +574,7 @@ object AgentMain {
             telemetry.agentStatus(
                 "indexing",
                 "Zaktualizowano indeks: $pathStr · ${result.currentState.size} pozycji",
+                totalScanned, totalScanned, null,
             )
         }
     }
