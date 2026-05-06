@@ -503,12 +503,20 @@ object AgentMain {
             telemetry.agentStatus("indexing", "Skan dysku: $pathStr", prevTotalFiles, 0, null)
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
-            val lastSendMs = longArrayOf(System.currentTimeMillis())
-            val progressListener = ScanProgressListener { scanned, currentFile ->
+            val lastStatusMs = longArrayOf(System.currentTimeMillis())
+            val lastBatchMs = longArrayOf(System.currentTimeMillis())
+            val pendingFiles = ArrayList<String>()
+            val progressListener = ScanProgressListener { scanned, currentFile, recentFiles ->
+                pendingFiles.addAll(recentFiles)
                 val now = System.currentTimeMillis()
-                if (now - lastSendMs[0] >= 800) {
-                    lastSendMs[0] = now
+                if (now - lastStatusMs[0] >= 800) {
+                    lastStatusMs[0] = now
                     telemetry.agentStatus("indexing", "Skan dysku: $pathStr", prevTotalFiles, scanned, currentFile)
+                }
+                if (now - lastBatchMs[0] >= 2000 && pendingFiles.isNotEmpty()) {
+                    lastBatchMs[0] = now
+                    telemetry.fileStateBatch(ArrayList(pendingFiles), "current")
+                    pendingFiles.clear()
                 }
             }
 
@@ -518,6 +526,12 @@ object AgentMain {
                 System.err.println("  ABORT: ${e.message}")
                 telemetry.log("Agent", -1001, "Scan failed: ${e.message}", "ERROR", mapOf("path" to pathStr))
                 throw e
+            }
+
+            // Flush any remaining discovered files that weren't sent yet
+            if (pendingFiles.isNotEmpty()) {
+                telemetry.fileStateBatch(ArrayList(pendingFiles), "current")
+                pendingFiles.clear()
             }
 
             println("  Changed: ${result.changedFiles.size} files, Deleted: ${result.deletedRelativePaths.size} paths")
@@ -534,9 +548,8 @@ object AgentMain {
 
             if (result.changedFiles.isNotEmpty()) {
                 telemetry.agentStatus("uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)", totalScanned, totalScanned, null)
-                result.changedFiles.forEach { f ->
-                    telemetry.fileState(root.resolve(f).toString(), "changed")
-                }
+                val changedPaths = result.changedFiles.map { root.resolve(it).toString() }
+                telemetry.fileStateBatch(changedPaths, "changed")
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
                 if (idxSnap.isEmpty()) {
                     println("  (paths.idx snapshot not embedded — buffer unreachable or empty server_id)")
@@ -549,28 +562,19 @@ object AgentMain {
                 val encrypted = encrypt(password, tarGz)
                 uploader.upload(encrypted, pathId, pathStr, "A", serverId)
                 println("  Uploaded ${encrypted.size} bytes (encrypted) for $pathStr")
-                result.changedFiles.forEach { f ->
-                    telemetry.fileState(root.resolve(f).toString(), "current")
-                }
+                telemetry.fileStateBatch(changedPaths, "current")
             }
 
             if (result.deletedRelativePaths.isNotEmpty()) {
                 uploader.upload(ByteArray(0), pathId, pathStr, "D", serverId)
                 println("  Uploaded tombstone (D) for $pathStr")
-                result.deletedRelativePaths.forEach { d ->
-                    telemetry.fileState(root.resolve(d).toString(), "deleted")
-                }
+                val deletedPaths = result.deletedRelativePaths.map { root.resolve(it).toString() }
+                telemetry.fileStateBatch(deletedPaths, "deleted")
             }
 
             cache.save(result.currentState)
 
-            // Panel „Pliki na żywo”: po każdym skanie wyślij pełny zestaw znanych plików (nie tylko deltę).
-            // Bez tego kolejne cykle bez zmian nie wysyłają nic — tabela w panelu zostaje pusta.
-            if (global.agent.server_id.isNotBlank()) {
-                for ((rel, _) in result.currentState) {
-                    telemetry.fileState(root.resolve(rel).toString(), "current")
-                }
-            }
+
             telemetry.agentStatus(
                 "indexing",
                 "Zaktualizowano indeks: $pathStr · ${result.currentState.size} pozycji",
