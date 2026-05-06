@@ -17,6 +17,12 @@ dependencies {
 
 application {
     mainClass.set("pl.danielniemiec.properbackup.agent.AgentMain")
+    applicationDefaultJvmArgs = listOf(
+        "-Xms32m",
+        "-Xmx128m",
+        "-XX:+UseSerialGC",
+        "-XX:MaxMetaspaceSize=64m",
+    )
 }
 
 tasks.test {
