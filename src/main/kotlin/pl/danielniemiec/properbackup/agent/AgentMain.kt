@@ -448,7 +448,7 @@ object AgentMain {
                 }
             }
         } finally {
-            val pollSec = maxOf(60, global.agent.poll_interval_seconds)
+            val pollSec = maxOf(30, global.agent.poll_interval_seconds)
             telemetry.agentStatus("idle", "Oczekiwanie · następny skan za ok. ${pollSec} s", null, null, null)
         }
     }
@@ -466,13 +466,31 @@ object AgentMain {
                 }
             }
             var sec = 300
+            var telemetryForHeartbeat: RemoteTelemetry? = null
             try {
                 val g = ConfigLoader.loadGlobal(globalYml)
-                sec = maxOf(60, g.agent.poll_interval_seconds)
+                sec = maxOf(30, g.agent.poll_interval_seconds)
+                val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
+                telemetryForHeartbeat = RemoteTelemetry(g, machineId)
             } catch (ignored: Exception) {
             }
+            val heartbeatIntervalMs = 10_000L
+            var elapsed = 0L
+            val totalMs = sec * 1000L
             try {
-                Thread.sleep(sec * 1000L)
+                while (elapsed < totalMs && !Thread.currentThread().isInterrupted) {
+                    val sleepChunk = minOf(heartbeatIntervalMs, totalMs - elapsed)
+                    Thread.sleep(sleepChunk)
+                    elapsed += sleepChunk
+                    val remaining = maxOf(0, (totalMs - elapsed) / 1000)
+                    runCatching {
+                        telemetryForHeartbeat?.agentStatus(
+                            "idle",
+                            "Oczekiwanie · następny skan za ok. ${remaining} s",
+                            null, null, null,
+                        )
+                    }
+                }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
