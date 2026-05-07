@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  agent:
+    build: .
+    container_name: properbackup-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount the directory you want to back up
+      - ./backup-source:/data/backup-source:ro
+      # Persistent state (differential scan cache)
+      - agent-state:/data/state
+      # Optional: mount custom service configs
+      # - ./conf.d:/data/conf.d
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 256m
+    cpus: 0.5
+
+volumes:
+  agent-state:

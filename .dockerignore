@@ -1,0 +1,10 @@
+.git
+.gradle
+.idea
+*.iml
+src
+build/classes
+build/kotlin
+build/tmp
+build/reports
+build/generated
