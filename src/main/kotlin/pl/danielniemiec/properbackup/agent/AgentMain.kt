@@ -33,6 +33,9 @@ import kotlin.system.exitProcess
 
 object AgentMain {
 
+    /** Max uncompressed size per chunk batch (~50 MB). Keeps memory usage and upload payloads manageable. */
+    private const val CHUNK_MAX_BYTES = 50L * 1024 * 1024
+
     private const val OPEN_PANEL_URL = "--open-panel-url"
     /** Natywna powłoka (np. macOS WKWebView): nie odpalaj drugiego JVM / przeglądarki — URL ładuje host. */
     private const val EMBEDDED_PANEL = "--embedded-panel"
@@ -554,14 +557,17 @@ object AgentMain {
                 if (idxSnap.isEmpty()) {
                     println("  (paths.idx snapshot not embedded — buffer unreachable or empty server_id)")
                 }
-                val tarGz = TarGzPacker.packToBytes(
-                    root,
-                    result.changedFiles,
-                    if (idxSnap.isNotEmpty()) idxSnap else null,
-                )
-                val encrypted = encrypt(password, tarGz)
-                uploader.upload(encrypted, pathId, pathStr, "A", serverId)
-                println("  Uploaded ${encrypted.size} bytes (encrypted) for $pathStr")
+
+                val batches = splitIntoBatches(root, result.changedFiles, CHUNK_MAX_BYTES)
+                println("  Split ${result.changedFiles.size} files into ${batches.size} chunk(s)")
+                for ((batchIdx, batch) in batches.withIndex()) {
+                    telemetry.agentStatus("uploading", "Wysyłanie chunk ${batchIdx + 1}/${batches.size}: $pathStr", totalScanned, totalScanned, null)
+                    val embedIdx = if (batchIdx == 0 && idxSnap.isNotEmpty()) idxSnap else null
+                    val tarGz = TarGzPacker.packToBytes(root, batch, embedIdx)
+                    val encrypted = encrypt(password, tarGz)
+                    uploader.upload(encrypted, pathId, pathStr, "A", serverId)
+                    println("  Uploaded chunk ${batchIdx + 1}/${batches.size}: ${encrypted.size} bytes (encrypted)")
+                }
                 telemetry.fileStateBatch(changedPaths, "current")
             }
 
@@ -588,5 +594,23 @@ object AgentMain {
         val out = ByteArrayOutputStream()
         ProperCrypto.encrypt(password.toCharArray(), ByteArrayInputStream(plain), out)
         return out.toByteArray()
+    }
+
+    private fun splitIntoBatches(root: Path, files: List<Path>, maxBytes: Long): List<List<Path>> {
+        val batches = mutableListOf<MutableList<Path>>()
+        var current = mutableListOf<Path>()
+        var currentSize = 0L
+        for (f in files) {
+            val size = try { Files.size(root.resolve(f)) } catch (_: IOException) { 0L }
+            if (current.isNotEmpty() && currentSize + size > maxBytes) {
+                batches.add(current)
+                current = mutableListOf()
+                currentSize = 0L
+            }
+            current.add(f)
+            currentSize += size
+        }
+        if (current.isNotEmpty()) batches.add(current)
+        return batches
     }
 }
