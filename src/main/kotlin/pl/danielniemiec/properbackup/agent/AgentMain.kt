@@ -26,6 +26,7 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.lang.management.ManagementFactory
 import java.util.Locale
 import java.util.Optional
 import kotlin.system.exitProcess
@@ -442,6 +443,8 @@ object AgentMain {
                     println("--- Service: ${svc.service}")
                     runService(svc, global, stateDir, password, uploader, dryRun, global.agent.server_id, telemetry)
                 }
+                println("[agent] Notifying buffer: scan-complete")
+                uploader.notifyScanComplete(global.agent.server_id)
             }
         } finally {
             val pollSec = maxOf(60, global.agent.poll_interval_seconds)
@@ -462,16 +465,37 @@ object AgentMain {
                 }
             }
             var sec = 300
+            var metricsUploader: BufferUploader? = null
+            var metricsServerId = ""
             try {
                 val g = ConfigLoader.loadGlobal(globalYml)
                 sec = maxOf(60, g.agent.poll_interval_seconds)
+                if (g.agent.server_id.isNotBlank()) {
+                    val tok = resolveEnv(g.agent.upload_token)
+                    metricsUploader = BufferUploader(g.agent.buffer_url, tok)
+                    metricsServerId = g.agent.server_id
+                }
             } catch (ignored: Exception) {
             }
+            val heartbeatIntervalMs = 10_000L
+            var elapsed = 0L
+            val totalMs = sec * 1000L
             try {
-                Thread.sleep(sec * 1000L)
+                while (elapsed < totalMs && !Thread.currentThread().isInterrupted) {
+                    val sleepChunk = minOf(heartbeatIntervalMs, totalMs - elapsed)
+                    Thread.sleep(sleepChunk)
+                    elapsed += sleepChunk
+                    val remaining = maxOf(0, (totalMs - elapsed) / 1000)
+                    runCatching {
+                        val (cpu, ramUsed, ramTotal) = collectMetrics()
+                        metricsUploader?.reportMetrics(metricsServerId, cpu, ramUsed, ramTotal)
+                    }
+                }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
+            } finally {
+                runCatching { metricsUploader?.close() }
             }
         }
     }
@@ -569,5 +593,21 @@ object AgentMain {
         val out = ByteArrayOutputStream()
         ProperCrypto.encrypt(password.toCharArray(), ByteArrayInputStream(plain), out)
         return out.toByteArray()
+    }
+
+    private data class Metrics(val cpuPercent: Float, val ramUsedMb: Float, val ramTotalMb: Float)
+
+    private fun collectMetrics(): Metrics {
+        val osBean = ManagementFactory.getOperatingSystemMXBean()
+        val cpu = if (osBean is com.sun.management.OperatingSystemMXBean) {
+            (osBean.processCpuLoad * 100).toFloat()
+        } else {
+            (osBean.systemLoadAverage.toFloat() / Runtime.getRuntime().availableProcessors() * 100)
+                .coerceIn(0f, 100f)
+        }
+        val rt = Runtime.getRuntime()
+        val totalMb = rt.maxMemory() / (1024f * 1024f)
+        val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024f * 1024f)
+        return Metrics(cpu, usedMb, totalMb)
     }
 }
