@@ -447,8 +447,8 @@ object AgentMain {
                 uploader.notifyScanComplete(global.agent.server_id)
             }
         } finally {
-            val pollSec = maxOf(60, global.agent.poll_interval_seconds)
-            telemetry.agentStatus("idle", "Oczekiwanie · następny skan za ok. ${pollSec} s")
+            val pauseSec = maxOf(5, global.agent.poll_interval_seconds)
+            telemetry.agentStatus("idle", "Skan zakończony · następny za ${pauseSec}s")
         }
     }
 
@@ -464,12 +464,14 @@ object AgentMain {
                     RemoteTelemetry(g, machineId).log("Agent", -500, "Cycle error: ${e.message ?: e}", "ERROR")
                 }
             }
-            var sec = 300
+            // Continuous scanning: short pause (5s default) between cycles instead of 60s idle.
+            // Configurable via PROPERBACKUP_POLL_INTERVAL; minimum is 5s.
+            var pauseSec = 5
             var metricsUploader: BufferUploader? = null
             var metricsServerId = ""
             try {
                 val g = ConfigLoader.loadGlobal(globalYml)
-                sec = maxOf(60, g.agent.poll_interval_seconds)
+                pauseSec = maxOf(5, g.agent.poll_interval_seconds)
                 if (g.agent.server_id.isNotBlank()) {
                     val tok = resolveEnv(g.agent.upload_token)
                     metricsUploader = BufferUploader(g.agent.buffer_url, tok)
@@ -479,16 +481,19 @@ object AgentMain {
             }
             val heartbeatIntervalMs = 10_000L
             var elapsed = 0L
-            val totalMs = sec * 1000L
+            val totalMs = pauseSec * 1000L
             try {
                 while (elapsed < totalMs && !Thread.currentThread().isInterrupted) {
                     val sleepChunk = minOf(heartbeatIntervalMs, totalMs - elapsed)
                     Thread.sleep(sleepChunk)
                     elapsed += sleepChunk
-                    val remaining = maxOf(0, (totalMs - elapsed) / 1000)
                     runCatching {
-                        val (cpu, ramUsed, ramTotal) = collectMetrics()
-                        metricsUploader?.reportMetrics(metricsServerId, cpu, ramUsed, ramTotal)
+                        val metrics = collectMetrics()
+                        metricsUploader?.reportMetrics(
+                            metricsServerId,
+                            metrics.cpuPercent, metrics.ramUsedMb, metrics.ramTotalMb,
+                            metrics.perCoreCpu, metrics.coreCount,
+                        )
                     }
                 }
             } catch (e: InterruptedException) {
@@ -595,19 +600,95 @@ object AgentMain {
         return out.toByteArray()
     }
 
-    private data class Metrics(val cpuPercent: Float, val ramUsedMb: Float, val ramTotalMb: Float)
+    private data class Metrics(
+        val cpuPercent: Float,
+        val ramUsedMb: Float,
+        val ramTotalMb: Float,
+        val perCoreCpu: List<Float>,
+        val coreCount: Int,
+    )
 
     private fun collectMetrics(): Metrics {
         val osBean = ManagementFactory.getOperatingSystemMXBean()
-        val cpu = if (osBean is com.sun.management.OperatingSystemMXBean) {
-            (osBean.processCpuLoad * 100).toFloat()
+        val coreCount = Runtime.getRuntime().availableProcessors()
+        val cpu: Float
+        val perCore = ArrayList<Float>(coreCount)
+
+        if (osBean is com.sun.management.OperatingSystemMXBean) {
+            // System-wide CPU (all cores averaged)
+            cpu = (osBean.systemCpuLoad * 100).toFloat().coerceIn(0f, 100f)
+            // Per-core: use /proc/stat on Linux, fallback to even distribution
+            val perCoreFromProc = readProcStatPerCore(coreCount)
+            if (perCoreFromProc != null) {
+                perCore.addAll(perCoreFromProc)
+            } else {
+                repeat(coreCount) { perCore.add(cpu) }
+            }
         } else {
-            (osBean.systemLoadAverage.toFloat() / Runtime.getRuntime().availableProcessors() * 100)
-                .coerceIn(0f, 100f)
+            cpu = (osBean.systemLoadAverage.toFloat() / coreCount * 100).coerceIn(0f, 100f)
+            repeat(coreCount) { perCore.add(cpu) }
         }
+
         val rt = Runtime.getRuntime()
         val totalMb = rt.maxMemory() / (1024f * 1024f)
         val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024f * 1024f)
-        return Metrics(cpu, usedMb, totalMb)
+        return Metrics(cpu, usedMb, totalMb, perCore, coreCount)
+    }
+
+    /**
+     * Read per-core CPU usage from /proc/stat (Linux only).
+     * Returns null on non-Linux systems or if reading fails.
+     */
+    @Volatile private var prevCoreTimes: LongArray? = null
+    @Volatile private var prevCoreIdle: LongArray? = null
+
+    private fun readProcStatPerCore(coreCount: Int): List<Float>? {
+        try {
+            val procStat = java.io.File("/proc/stat")
+            if (!procStat.exists()) return null
+
+            val lines = procStat.readLines()
+            val coreTotals = LongArray(coreCount)
+            val coreIdles = LongArray(coreCount)
+            var found = 0
+
+            for (line in lines) {
+                if (!line.startsWith("cpu") || line.startsWith("cpu ")) continue
+                val parts = line.trim().split("\\s+".toRegex())
+                if (parts.size < 5) continue
+                val coreIdx = parts[0].removePrefix("cpu").toIntOrNull() ?: continue
+                if (coreIdx >= coreCount) continue
+                // fields: user nice system idle iowait irq softirq steal
+                val vals = parts.drop(1).mapNotNull { it.toLongOrNull() }
+                if (vals.size < 4) continue
+                val idle = vals[3] + (if (vals.size > 4) vals[4] else 0L)
+                val total = vals.sum()
+                coreTotals[coreIdx] = total
+                coreIdles[coreIdx] = idle
+                found++
+            }
+
+            if (found < coreCount) return null
+
+            val prev = prevCoreTimes
+            val prevIdle = prevCoreIdle
+            prevCoreTimes = coreTotals.clone()
+            prevCoreIdle = coreIdles.clone()
+
+            if (prev == null || prevIdle == null || prev.size != coreCount) {
+                return null
+            }
+
+            val result = ArrayList<Float>(coreCount)
+            for (i in 0 until coreCount) {
+                val dTotal = coreTotals[i] - prev[i]
+                val dIdle = coreIdles[i] - prevIdle[i]
+                val usage = if (dTotal > 0) ((dTotal - dIdle).toFloat() / dTotal * 100f).coerceIn(0f, 100f) else 0f
+                result.add(usage)
+            }
+            return result
+        } catch (_: Exception) {
+            return null
+        }
     }
 }
