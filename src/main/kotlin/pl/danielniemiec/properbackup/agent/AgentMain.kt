@@ -551,7 +551,7 @@ object AgentMain {
 
             if (result.changedFiles.isNotEmpty()) {
                 telemetry.agentStatus("uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)")
-                result.changedFiles.forEach { f ->
+                result.changedFiles.take(200).forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "changed")
                 }
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
@@ -584,8 +584,11 @@ object AgentMain {
             // Panel „Pliki na żywo”: po każdym skanie wyślij pełny zestaw znanych plików (nie tylko deltę).
             // Bez tego kolejne cykle bez zmian nie wysyłają nic — tabela w panelu zostaje pusta.
             if (global.agent.server_id.isNotBlank()) {
+                var sent = 0
                 for ((rel, _) in result.currentState) {
                     telemetry.fileState(root.resolve(rel).toString(), "current")
+                    sent++
+                    if (sent % 100 == 0) Thread.yield()
                 }
             }
             telemetry.agentStatus(
@@ -698,8 +701,14 @@ object AgentMain {
             val pid = ProcessHandle.current().pid()
             val os = System.getProperty("os.name", "").lowercase(java.util.Locale.ROOT)
             if (os.contains("linux")) {
-                Runtime.getRuntime().exec(arrayOf("renice", "-n", "19", "-p", pid.toString()))
-                runCatching { Runtime.getRuntime().exec(arrayOf("ionice", "-c", "3", "-p", pid.toString())) }
+                val renice = Runtime.getRuntime().exec(arrayOf("renice", "-n", "19", "-p", pid.toString()))
+                renice.waitFor()
+                renice.destroy()
+                runCatching {
+                    val ionice = Runtime.getRuntime().exec(arrayOf("ionice", "-c", "3", "-p", pid.toString()))
+                    ionice.waitFor()
+                    ionice.destroy()
+                }
                 println("[agent] Set low priority: nice=19 ionice=idle (pid=$pid)")
             }
             nicePrioritySet = true
