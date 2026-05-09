@@ -453,6 +453,7 @@ object AgentMain {
     }
 
     private fun runAgentLoop(globalYml: Path, confDir: Path, dryRun: Boolean) {
+        setLowPriority()
         while (!Thread.currentThread().isInterrupted) {
             try {
                 runOneBackupCycle(globalYml, confDir, dryRun)
@@ -493,6 +494,7 @@ object AgentMain {
                             metricsServerId,
                             metrics.cpuPercent, metrics.ramUsedMb, metrics.ramTotalMb,
                             metrics.perCoreCpu, metrics.coreCount,
+                            metrics.agentCpuPercent,
                         )
                     }
                 }
@@ -602,6 +604,7 @@ object AgentMain {
 
     private data class Metrics(
         val cpuPercent: Float,
+        val agentCpuPercent: Float,
         val ramUsedMb: Float,
         val ramTotalMb: Float,
         val perCoreCpu: List<Float>,
@@ -610,42 +613,110 @@ object AgentMain {
 
     private fun collectMetrics(): Metrics {
         val osBean = ManagementFactory.getOperatingSystemMXBean()
-        val coreCount = Runtime.getRuntime().availableProcessors()
+        val hostCoreCount = detectHostCoreCount()
         val cpu: Float
-        val perCore = ArrayList<Float>(coreCount)
+        val agentCpu: Float
+        val perCore = ArrayList<Float>(hostCoreCount)
 
         if (osBean is com.sun.management.OperatingSystemMXBean) {
-            // System-wide CPU (all cores averaged)
             cpu = (osBean.systemCpuLoad * 100).toFloat().coerceIn(0f, 100f)
-            // Per-core: use /proc/stat on Linux, fallback to even distribution
-            val perCoreFromProc = readProcStatPerCore(coreCount)
+            agentCpu = (osBean.processCpuLoad * 100).toFloat().coerceIn(0f, 100f)
+            val perCoreFromProc = readProcStatPerCore(hostCoreCount)
             if (perCoreFromProc != null) {
                 perCore.addAll(perCoreFromProc)
             } else {
-                repeat(coreCount) { perCore.add(cpu) }
+                repeat(hostCoreCount) { perCore.add(cpu) }
             }
         } else {
-            cpu = (osBean.systemLoadAverage.toFloat() / coreCount * 100).coerceIn(0f, 100f)
-            repeat(coreCount) { perCore.add(cpu) }
+            cpu = (osBean.systemLoadAverage.toFloat() / hostCoreCount * 100).coerceIn(0f, 100f)
+            agentCpu = 0f
+            repeat(hostCoreCount) { perCore.add(cpu) }
         }
 
         val rt = Runtime.getRuntime()
-        val totalMb = rt.maxMemory() / (1024f * 1024f)
-        val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024f * 1024f)
-        return Metrics(cpu, usedMb, totalMb, perCore, coreCount)
+        val totalMb = readHostMemoryMb() ?: (rt.maxMemory() / (1024f * 1024f))
+        val usedMb = readHostUsedMemoryMb() ?: ((rt.totalMemory() - rt.freeMemory()) / (1024f * 1024f))
+        return Metrics(cpu, agentCpu, usedMb, totalMb, perCore, hostCoreCount)
     }
 
-    /**
-     * Read per-core CPU usage from /proc/stat (Linux only).
-     * Returns null on non-Linux systems or if reading fails.
-     */
+    private fun detectHostCoreCount(): Int {
+        for (path in listOf("/host/proc/stat", "/proc/stat")) {
+            try {
+                val f = java.io.File(path)
+                if (!f.exists()) continue
+                var count = 0
+                f.readLines().forEach { line ->
+                    if (line.startsWith("cpu") && !line.startsWith("cpu ")) count++
+                }
+                if (count > 0) return count
+            } catch (_: Exception) { }
+        }
+        return Runtime.getRuntime().availableProcessors()
+    }
+
+    private fun readHostMemoryMb(): Float? {
+        for (path in listOf("/host/proc/meminfo", "/proc/meminfo")) {
+            try {
+                val f = java.io.File(path)
+                if (!f.exists()) continue
+                for (line in f.readLines()) {
+                    if (line.startsWith("MemTotal:")) {
+                        val kb = line.replace("MemTotal:", "").replace("kB", "").trim().toLongOrNull() ?: continue
+                        return kb / 1024f
+                    }
+                }
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    private fun readHostUsedMemoryMb(): Float? {
+        for (path in listOf("/host/proc/meminfo", "/proc/meminfo")) {
+            try {
+                val f = java.io.File(path)
+                if (!f.exists()) continue
+                var total = 0L
+                var available = 0L
+                for (line in f.readLines()) {
+                    if (line.startsWith("MemTotal:")) {
+                        total = line.replace("MemTotal:", "").replace("kB", "").trim().toLongOrNull() ?: 0L
+                    } else if (line.startsWith("MemAvailable:")) {
+                        available = line.replace("MemAvailable:", "").replace("kB", "").trim().toLongOrNull() ?: 0L
+                    }
+                }
+                if (total > 0) return (total - available) / 1024f
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    @Volatile private var nicePrioritySet = false
+
+    private fun setLowPriority() {
+        if (nicePrioritySet) return
+        try {
+            val pid = ProcessHandle.current().pid()
+            val os = System.getProperty("os.name", "").lowercase(java.util.Locale.ROOT)
+            if (os.contains("linux")) {
+                Runtime.getRuntime().exec(arrayOf("renice", "-n", "19", "-p", pid.toString()))
+                runCatching { Runtime.getRuntime().exec(arrayOf("ionice", "-c", "3", "-p", pid.toString())) }
+                println("[agent] Set low priority: nice=19 ionice=idle (pid=$pid)")
+            }
+            nicePrioritySet = true
+        } catch (_: Exception) { }
+    }
+
     @Volatile private var prevCoreTimes: LongArray? = null
     @Volatile private var prevCoreIdle: LongArray? = null
 
     private fun readProcStatPerCore(coreCount: Int): List<Float>? {
         try {
-            val procStat = java.io.File("/proc/stat")
-            if (!procStat.exists()) return null
+            var procStat: java.io.File? = null
+            for (path in listOf("/host/proc/stat", "/proc/stat")) {
+                val f = java.io.File(path)
+                if (f.exists()) { procStat = f; break }
+            }
+            if (procStat == null) return null
 
             val lines = procStat.readLines()
             val coreTotals = LongArray(coreCount)
@@ -658,7 +729,6 @@ object AgentMain {
                 if (parts.size < 5) continue
                 val coreIdx = parts[0].removePrefix("cpu").toIntOrNull() ?: continue
                 if (coreIdx >= coreCount) continue
-                // fields: user nice system idle iowait irq softirq steal
                 val vals = parts.drop(1).mapNotNull { it.toLongOrNull() }
                 if (vals.size < 4) continue
                 val idle = vals[3] + (if (vals.size > 4) vals[4] else 0L)
