@@ -523,10 +523,13 @@ object AgentMain {
         val cache = MetadataCache(stateDir, svc.service!!)
         val prevState = cache.load()
 
+        var totalFilesDiscovered = 0
+        var filesProcessed = 0
+
         for (pathStr in svc.paths!!) {
             val root = Path.of(pathStr)
             println("  Scanning: $root")
-            telemetry.agentStatus("indexing", "Skan dysku: $pathStr")
+            telemetry.agentStatus("indexing", "Skan dysku: $pathStr", currentFile = pathStr)
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
             val result = try {
@@ -537,20 +540,38 @@ object AgentMain {
                 throw e
             }
 
+            totalFilesDiscovered += result.currentState.size
+            telemetry.agentStatus(
+                "scanning", "Znaleziono ${result.currentState.size} plików w $pathStr",
+                totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
+            )
+
             println("  Changed: ${result.changedFiles.size} files, Deleted: ${result.deletedRelativePaths.size} paths")
 
             if (dryRun) {
                 result.changedFiles.forEach { f -> println("  [DRY] changed: $f") }
                 result.deletedRelativePaths.forEach { d -> println("  [DRY] deleted: $d") }
+                filesProcessed += result.currentState.size
                 continue
             }
 
             val pathId = ProperCodec.pathToId(pathStr)
 
             if (result.changedFiles.isNotEmpty()) {
-                telemetry.agentStatus("uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)")
-                result.changedFiles.forEach { f ->
+                telemetry.agentStatus(
+                    "uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)",
+                    totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
+                )
+                result.changedFiles.forEachIndexed { idx, f ->
                     telemetry.fileState(root.resolve(f).toString(), "changed")
+                    if (idx % 50 == 0) {
+                        telemetry.agentStatus(
+                            "uploading", "Przesyłanie: ${root.resolve(f).fileName}",
+                            totalFiles = totalFilesDiscovered,
+                            scannedFiles = filesProcessed + idx,
+                            currentFile = root.resolve(f).toString(),
+                        )
+                    }
                 }
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
                 if (idxSnap.isEmpty()) {
@@ -567,6 +588,7 @@ object AgentMain {
                 result.changedFiles.forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "current")
                 }
+                filesProcessed += result.changedFiles.size
             }
 
             if (result.deletedRelativePaths.isNotEmpty()) {
@@ -586,9 +608,11 @@ object AgentMain {
                     telemetry.fileState(root.resolve(rel).toString(), "current")
                 }
             }
+            filesProcessed += result.currentState.size - result.changedFiles.size
             telemetry.agentStatus(
                 "indexing",
                 "Zaktualizowano indeks: $pathStr · ${result.currentState.size} pozycji",
+                totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
             )
         }
     }
