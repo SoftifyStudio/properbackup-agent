@@ -601,12 +601,13 @@ object AgentMain {
 
             cache.save(result.currentState)
 
-            // Panel „Pliki na żywo”: po każdym skanie wyślij pełny zestaw znanych plików (nie tylko deltę).
-            // Bez tego kolejne cykle bez zmian nie wysyłają nic — tabela w panelu zostaje pusta.
-            if (global.agent.server_id.isNotBlank()) {
-                for ((rel, _) in result.currentState) {
-                    telemetry.fileState(root.resolve(rel).toString(), "current")
+            // Initial sync: on first scan (prevState empty) send all known files as a single batch.
+            // Subsequent cycles only send deltas (changed/deleted) which the code above already handles.
+            if (prevState.isEmpty() && result.currentState.isNotEmpty() && global.agent.server_id.isNotBlank()) {
+                val batch = result.currentState.map { (rel, _) ->
+                    root.resolve(rel).toString() to "current"
                 }
+                telemetry.fileStateBatch(batch)
             }
             filesProcessed += result.currentState.size - result.changedFiles.size
             telemetry.agentStatus(
