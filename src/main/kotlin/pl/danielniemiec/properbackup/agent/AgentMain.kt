@@ -20,6 +20,8 @@ import pl.danielniemiec.properbackup.agent.util.StartupTrace
 import pl.danielniemiec.properbackup.core.codec.ProperCodec
 import pl.danielniemiec.properbackup.core.crypto.ProperCrypto
 import java.awt.GraphicsEnvironment
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -577,29 +579,42 @@ object AgentMain {
                     "uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)",
                     totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
                 )
-                result.changedFiles.forEachIndexed { idx, f ->
+                result.changedFiles.forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "changed")
-                    if (idx % 50 == 0) {
-                        telemetry.agentStatus(
-                            "uploading", "Przesyłanie: ${root.resolve(f).fileName}",
-                            totalFiles = totalFilesDiscovered,
-                            scannedFiles = filesProcessed + idx,
-                            currentFile = root.resolve(f).toString(),
-                        )
-                    }
                 }
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
                 if (idxSnap.isEmpty()) {
                     println("  (paths.idx snapshot not embedded — buffer unreachable or empty server_id)")
                 }
-                val tarGz = TarGzPacker.packToBytes(
-                    root,
-                    result.changedFiles,
-                    if (idxSnap.isNotEmpty()) idxSnap else null,
-                )
-                val encrypted = encrypt(password, tarGz)
-                uploader.upload(encrypted, pathId, pathStr, "A", serverId)
-                println("  Uploaded ${encrypted.size} bytes (encrypted) for $pathStr")
+
+                val batches = splitIntoBatches(root, result.changedFiles, BATCH_MAX_BYTES)
+                println("  Split ${result.changedFiles.size} files into ${batches.size} batch(es)")
+                for ((batchIdx, batch) in batches.withIndex()) {
+                    val batchId = if (batches.size == 1) pathId else "$pathId-b$batchIdx"
+                    telemetry.agentStatus(
+                        "uploading",
+                        "Przesyłanie partii ${batchIdx + 1}/${batches.size}: ${batch.size} plików",
+                        totalFiles = totalFilesDiscovered,
+                        scannedFiles = filesProcessed + (batchIdx * (result.changedFiles.size / batches.size)),
+                        currentFile = pathStr,
+                    )
+                    val tmpTarGz = Files.createTempFile("pb-pack-", ".tar.gz")
+                    val tmpEncrypted = Files.createTempFile("pb-enc-", ".bin")
+                    try {
+                        TarGzPacker.packToFile(
+                            root, batch,
+                            if (batchIdx == 0 && idxSnap.isNotEmpty()) idxSnap else null,
+                            tmpTarGz,
+                        )
+                        encryptFile(password, tmpTarGz, tmpEncrypted)
+                        val encSize = Files.size(tmpEncrypted)
+                        uploader.uploadFile(tmpEncrypted, batchId, pathStr, "A", serverId)
+                        println("  Batch ${batchIdx + 1}: uploaded ${encSize / 1024}KB (encrypted)")
+                    } finally {
+                        Files.deleteIfExists(tmpTarGz)
+                        Files.deleteIfExists(tmpEncrypted)
+                    }
+                }
                 result.changedFiles.forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "current")
                 }
@@ -637,6 +652,39 @@ object AgentMain {
         val out = ByteArrayOutputStream()
         ProperCrypto.encrypt(password.toCharArray(), ByteArrayInputStream(plain), out)
         return out.toByteArray()
+    }
+
+    @Throws(Exception::class)
+    private fun encryptFile(password: String, src: Path, dest: Path) {
+        BufferedInputStream(Files.newInputStream(src)).use { input ->
+            BufferedOutputStream(Files.newOutputStream(dest)).use { output ->
+                ProperCrypto.encrypt(password.toCharArray(), input, output)
+            }
+        }
+    }
+
+    private fun splitIntoBatches(root: Path, files: List<Path>, maxBytes: Long): List<List<Path>> {
+        val batches = ArrayList<List<Path>>()
+        var currentBatch = ArrayList<Path>()
+        var currentSize = 0L
+        for (file in files) {
+            val fileSize = try { Files.size(file) } catch (_: IOException) { 0L }
+            if (currentBatch.isNotEmpty() && currentSize + fileSize > maxBytes) {
+                batches.add(currentBatch)
+                currentBatch = ArrayList()
+                currentSize = 0L
+            }
+            currentBatch.add(file)
+            currentSize += fileSize
+        }
+        if (currentBatch.isNotEmpty()) {
+            batches.add(currentBatch)
+        }
+        return batches
+    }
+
+    companion object {
+        private const val BATCH_MAX_BYTES = 900L * 1024 * 1024
     }
 
     private data class Metrics(
