@@ -579,9 +579,6 @@ object AgentMain {
                     "uploading", "Pakowanie kopii: $pathStr (${result.changedFiles.size} plików)",
                     totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
                 )
-                result.changedFiles.forEach { f ->
-                    telemetry.fileState(root.resolve(f).toString(), "changed")
-                }
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
                 if (idxSnap.isEmpty()) {
                     println("  (paths.idx snapshot not embedded — buffer unreachable or empty server_id)")
@@ -615,9 +612,6 @@ object AgentMain {
                         Files.deleteIfExists(tmpEncrypted)
                     }
                 }
-                result.changedFiles.forEach { f ->
-                    telemetry.fileState(root.resolve(f).toString(), "current")
-                }
                 filesProcessed += result.changedFiles.size
             }
 
@@ -633,10 +627,11 @@ object AgentMain {
 
             // Panel „Pliki na żywo”: po każdym skanie wyślij pełny zestaw znanych plików (nie tylko deltę).
             // Bez tego kolejne cykle bez zmian nie wysyłają nic — tabela w panelu zostaje pusta.
-            if (global.agent.server_id.isNotBlank()) {
-                for ((rel, _) in result.currentState) {
-                    telemetry.fileState(root.resolve(rel).toString(), "current")
+            if (global.agent.server_id.isNotBlank() && result.currentState.isNotEmpty()) {
+                val states = result.currentState.map { (rel, _) ->
+                    root.resolve(rel).toString() to "current"
                 }
+                telemetry.fileStateBatch(states)
             }
             filesProcessed += result.currentState.size - result.changedFiles.size
             telemetry.agentStatus(
@@ -683,9 +678,7 @@ object AgentMain {
         return batches
     }
 
-    companion object {
-        private const val BATCH_MAX_BYTES = 900L * 1024 * 1024
-    }
+    private const val BATCH_MAX_BYTES = 900L * 1024 * 1024
 
     private data class Metrics(
         val cpuPercent: Float,
