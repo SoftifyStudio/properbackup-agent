@@ -399,7 +399,7 @@ object AgentMain {
         }
         val telemetry = RemoteTelemetry(global, machineId)
         telemetry.agentStatus(
-            "indexing",
+            "scanning",
             if (global.agent.server_id.isBlank()) {
                 "Uzupełnij agent.server_id — ten sam identyfikator co „Identyfikator serwera” w panelu."
             } else {
@@ -436,7 +436,7 @@ object AgentMain {
                     }
                     val rootsList = pairsMap.entries.map { it.key to it.value }
                     if (rootsList.isNotEmpty()) {
-                        telemetry.agentStatus("indexing", "Rejestrowanie ${rootsList.size} ścieżek w panelu…")
+                        telemetry.agentStatus("scanning", "Rejestrowanie ${rootsList.size} ścieżek w panelu…")
                         uploader.registerPaths(global.agent.server_id, rootsList)
                         uploader.postBackupRoots(machineId, rootsList)
                     }
@@ -531,7 +531,7 @@ object AgentMain {
         for (pathStr in svc.paths!!) {
             val root = Path.of(pathStr)
             println("  Scanning: $root")
-            telemetry.agentStatus("indexing", "Skan dysku: $pathStr", currentFile = pathStr)
+            telemetry.agentStatus("scanning", "Skan dysku: $pathStr", currentFile = pathStr)
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
             val result = try {
@@ -544,7 +544,7 @@ object AgentMain {
                             currentFile = pathStr,
                         )
                         "processing" -> telemetry.agentStatus(
-                            "indexing", "Sprawdzanie plików: $current / $total",
+                            "scanning", "Sprawdzanie plików: $current / $total",
                             totalFiles = totalFilesDiscovered + total,
                             scannedFiles = filesProcessed + current,
                             currentFile = pathStr,
@@ -635,7 +635,7 @@ object AgentMain {
             }
             filesProcessed += result.currentState.size - result.changedFiles.size
             telemetry.agentStatus(
-                "indexing",
+                "scanning",
                 "Zaktualizowano indeks: $pathStr · ${result.currentState.size} pozycji",
                 totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
             )
