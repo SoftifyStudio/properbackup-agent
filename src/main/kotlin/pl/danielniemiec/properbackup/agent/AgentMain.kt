@@ -640,7 +640,7 @@ object AgentMain {
 
         if (osBean is com.sun.management.OperatingSystemMXBean) {
             // System-wide CPU (all cores averaged)
-            cpu = (osBean.systemCpuLoad * 100).toFloat().coerceIn(0f, 100f)
+            cpu = (osBean.cpuLoad * 100).toFloat().coerceIn(0f, 100f)
             // Per-core: use /proc/stat on Linux, fallback to even distribution
             val perCoreFromProc = readProcStatPerCore(coreCount)
             if (perCoreFromProc != null) {
