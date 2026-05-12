@@ -21,6 +21,10 @@ dependencies {
 
 application {
     mainClass.set("pl.danielniemiec.properbackup.agent.AgentMain")
+    applicationDefaultJvmArgs = listOf(
+        "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+        "-Xmx512m",
+    )
 }
 
 tasks.test {

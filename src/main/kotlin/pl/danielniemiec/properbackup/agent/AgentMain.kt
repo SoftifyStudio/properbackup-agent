@@ -678,7 +678,11 @@ object AgentMain {
         return batches
     }
 
-    private const val BATCH_MAX_BYTES = 900L * 1024 * 1024
+    // Buffer's PayloadGuard accepts max 100MB per upload.
+    // Raw files are packed (tar.gz) then encrypted before upload.
+    // 90MB raw keeps the final upload safely under 100MB even for incompressible data.
+    // The buffer's PackBuffer (900MB) combines multiple uploads into packs for OVH.
+    private const val BATCH_MAX_BYTES = 90L * 1024 * 1024
 
     private data class Metrics(
         val cpuPercent: Float,
