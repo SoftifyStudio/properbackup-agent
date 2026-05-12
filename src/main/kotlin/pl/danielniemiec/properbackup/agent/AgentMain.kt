@@ -533,7 +533,22 @@ object AgentMain {
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
             val result = try {
-                scanner.scan(root, prevState)
+                scanner.scan(root, prevState) { phase, current, total ->
+                    when (phase) {
+                        "discovering" -> telemetry.agentStatus(
+                            "scanning", "Przeszukiwanie: $pathStr ($current plików)",
+                            totalFiles = totalFilesDiscovered + current,
+                            scannedFiles = filesProcessed,
+                            currentFile = pathStr,
+                        )
+                        "processing" -> telemetry.agentStatus(
+                            "indexing", "Sprawdzanie plików: $current / $total",
+                            totalFiles = totalFilesDiscovered + total,
+                            scannedFiles = filesProcessed + current,
+                            currentFile = pathStr,
+                        )
+                    }
+                }
             } catch (e: IOException) {
                 System.err.println("  ABORT: ${e.message}")
                 telemetry.log("Agent", -1001, "Scan failed: ${e.message}", "ERROR", mapOf("path" to pathStr))
