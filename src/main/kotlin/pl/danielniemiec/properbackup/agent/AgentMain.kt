@@ -1,6 +1,7 @@
 package pl.danielniemiec.properbackup.agent
 
 import pl.danielniemiec.properbackup.agent.activation.ActivationClient
+import pl.danielniemiec.properbackup.agent.service.ServiceInstaller
 import pl.danielniemiec.properbackup.agent.activation.GlobalConfigWriter
 import pl.danielniemiec.properbackup.agent.browser.SystemBrowserLauncher
 import pl.danielniemiec.properbackup.agent.config.ConfigLoader
@@ -72,6 +73,9 @@ object AgentMain {
         var explicitHeadless = false
         var embeddedPanel = false
         var printPanelUrl = false
+        var installService = false
+        var uninstallService = false
+        var serviceStatus = false
 
         var i = 0
         while (i < args.size) {
@@ -84,6 +88,9 @@ object AgentMain {
                 "--headless" -> explicitHeadless = true
                 EMBEDDED_PANEL -> embeddedPanel = true
                 PRINT_PANEL_URL -> printPanelUrl = true
+                "--install-service" -> installService = true
+                "--uninstall-service" -> uninstallService = true
+                "--service-status" -> serviceStatus = true
                 "--activate" -> {
                     if (i + 1 < args.size && !args[i + 1].startsWith("--")) {
                         activateToken = args[++i]
@@ -94,6 +101,27 @@ object AgentMain {
                 else -> { /* ignore */ }
             }
             i++
+        }
+
+        if (installService) {
+            val jar = selfJarPath().orElse(null)
+            if (jar == null) {
+                System.err.println("Cannot determine agent JAR path. Run from a packaged JAR.")
+                exitProcess(1)
+            }
+            val result = ServiceInstaller.install(jar, confDir)
+            println(result.message)
+            if (result.path != null) println("Service file: ${result.path}")
+            exitProcess(if (result.success) 0 else 1)
+        }
+        if (uninstallService) {
+            val result = ServiceInstaller.uninstall()
+            println(result.message)
+            exitProcess(if (result.success) 0 else 1)
+        }
+        if (serviceStatus) {
+            println("Service status: ${ServiceInstaller.status()}")
+            exitProcess(0)
         }
 
         if (isExplorerStyleJarLaunch(args) && !explicitHeadless) {
