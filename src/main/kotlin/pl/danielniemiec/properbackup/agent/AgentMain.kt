@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.agent
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.agent.activation.ActivationClient
 import pl.danielniemiec.properbackup.agent.service.ServiceInstaller
 import pl.danielniemiec.properbackup.agent.activation.GlobalConfigWriter
@@ -34,6 +35,8 @@ import kotlin.system.exitProcess
 
 object AgentMain {
 
+    private val log = LoggerFactory.getLogger(AgentMain::class.java)
+
     private const val OPEN_PANEL_URL = "--open-panel-url"
     /** Natywna powłoka (np. macOS WKWebView): nie odpalaj drugiego JVM / przeglądarki — URL ładuje host. */
     private const val EMBEDDED_PANEL = "--embedded-panel"
@@ -56,7 +59,7 @@ object AgentMain {
         for (i in args.indices) {
             if (OPEN_PANEL_URL == args[i]) {
                 if (i + 1 >= args.size) {
-                    System.err.println("Brak URL po $OPEN_PANEL_URL")
+                    log.error("Missing URL after {}", OPEN_PANEL_URL)
                     exitProcess(2)
                 }
                 SystemBrowserLauncher.openUrl(args[i + 1])
@@ -106,21 +109,21 @@ object AgentMain {
         if (installService) {
             val jar = selfJarPath().orElse(null)
             if (jar == null) {
-                System.err.println("Cannot determine agent JAR path. Run from a packaged JAR.")
+                log.error("Cannot determine agent JAR path. Run from a packaged JAR.")
                 exitProcess(1)
             }
             val result = ServiceInstaller.install(jar, confDir)
-            println(result.message)
-            if (result.path != null) println("Service file: ${result.path}")
+            log.info("{}", result.message)
+            if (result.path != null) log.info("Service file: {}", result.path)
             exitProcess(if (result.success) 0 else 1)
         }
         if (uninstallService) {
             val result = ServiceInstaller.uninstall()
-            println(result.message)
+            log.info("{}", result.message)
             exitProcess(if (result.success) 0 else 1)
         }
         if (serviceStatus) {
-            println("Service status: ${ServiceInstaller.status()}")
+            log.info("Service status: {}", ServiceInstaller.status())
             exitProcess(0)
         }
 
@@ -137,10 +140,10 @@ object AgentMain {
             val url = try {
                 AgentPanelUrls.buildAgentLandingFromConfig(globalYml, activateToken)
             } catch (e: Exception) {
-                System.err.println("[agent] --print-panel-url: ${e.message ?: e}")
+                log.error("--print-panel-url: {}", e.message ?: e)
                 exitProcess(1)
             }
-            println("PANEL_URL=$url")
+            log.info("PANEL_URL={}", url)
             exitProcess(0)
         }
 
@@ -186,7 +189,7 @@ object AgentMain {
                     ),
                 )
             }
-            println("Otwieranie panelu (zalogowanie z fragmentu URL)…")
+            log.info("Opening panel (auth from URL fragment)")
             SystemBrowserLauncher.openUrl(open)
             return
         }
@@ -195,15 +198,15 @@ object AgentMain {
         AgentInstanceLock.tryAcquire(lockFile)?.use {
             if (once) {
                 runOneBackupCycle(globalYml, confDir, dryRun)
-                println("Agent run complete.")
+                log.info("Agent run complete.")
             } else {
                 runAgentLoop(globalYml, confDir, dryRun)
             }
         } ?: run {
             StartupTrace.line("acquireOrExit: zajęty lock — inna instancja: ${lockFile.toAbsolutePath()}")
-            System.err.println(
-                "ProperBackup agent jest już uruchomiony (inna instancja trzyma plik lock: " +
-                    "${lockFile.toAbsolutePath()}).",
+            log.error(
+                "ProperBackup agent is already running (another instance holds lock: {})",
+                lockFile.toAbsolutePath(),
             )
             exitProcess(1)
         }
@@ -274,10 +277,7 @@ object AgentMain {
     private fun acquireOrExit(lockFile: Path): AgentInstanceLock {
         return AgentInstanceLock.tryAcquire(lockFile) ?: run {
             StartupTrace.line("acquireOrExit: zajęty lock — inna instancja: ${lockFile.toAbsolutePath()}")
-            System.err.println(
-                "ProperBackup agent jest już uruchomiony (inna instancja trzyma plik lock: " +
-                    "${lockFile.toAbsolutePath()}).",
-            )
+            log.error("Agent is already running (lock: {})", lockFile.toAbsolutePath())
             exitProcess(1)
         }
     }
@@ -306,7 +306,7 @@ object AgentMain {
                 StartupTrace.line("runGuiAndAgent: panel spawn done, starting agent loop/cycle…")
                 if (once) {
                     runOneBackupCycle(gy, cd, dr)
-                    println("Agent run complete.")
+                    log.info("Agent run complete.")
                 } else {
                     runAgentLoop(gy, cd, dr)
                 }
@@ -316,7 +316,7 @@ object AgentMain {
                 "runGuiAndAgent: GUI singleton zajęty — inna instancja agenta z panelem (" +
                     GuiSingletonLock.lockFilePath() + ").",
             )
-            System.err.println("ProperBackup agent z panelem jest już uruchomiony.")
+            log.error("ProperBackup agent with panel is already running.")
             notifyMacGuiSingletonBlocked()
             exitProcess(0)
         }
@@ -357,14 +357,12 @@ object AgentMain {
                     .redirectError(ProcessBuilder.Redirect.INHERIT)
                     .redirectOutput(ProcessBuilder.Redirect.INHERIT)
                     .start()
-                println("[gui] Uruchomiono osobny proces panelu (przeglądarka).")
+                log.info("Spawned separate panel process (browser).")
                 StartupTrace.line("PROPERBACKUP_SUCCESS spawnPanel=child_jvm_open_panel_url")
                 return
             } catch (e: IOException) {
                 StartupTrace.line("spawnPanel: drugi JVM IOException: ${e.message} — openUrl w tej JVM.")
-                System.err.println(
-                    "[gui] Nie udało się uruchomić drugiego JVM: ${e.message} — otwieram panel w tej instancji.",
-                )
+                log.error("Failed to spawn second JVM: {} — opening panel in this instance.", e.message)
             }
         } else {
             StartupTrace.line("spawnPanel: brak ścieżki JAR (np. uruchomienie z IDE) — openUrl w tej JVM.")
@@ -382,16 +380,14 @@ object AgentMain {
         val fatName = fn.substring("original-".length)
         val fat = parent?.resolve(fatName)
         StartupTrace.line("BŁĄD: uruchomiono cienki JAR Shade (original-): ${jar.get()}")
-        System.err.println(
-            "ProperBackup: „$fn” to pomocniczy plik z budowania (Maven Shade) — bez bibliotek, agent się nie uruchomi.",
-        )
+        log.error("'{}' is a build artifact (Maven Shade) — missing libraries, agent won't start.", fn)
         if (fat != null) {
-            System.err.println("W tym samym folderze użyj pełnego pliku: $fatName")
+            log.error("Use the full file instead: {}", fatName)
             if (Files.exists(fat)) {
-                System.err.println("(Ścieżka: ${fat.toAbsolutePath()})")
+                log.error("(Path: {})", fat.toAbsolutePath())
             }
         }
-        System.err.println("Na macOS: ProperBackup-Agent-macos.command z tego samego folderu.")
+        log.error("On macOS: use ProperBackup-Agent-macos.command from the same folder.")
         val os = System.getProperty("os.name", "").lowercase(Locale.ROOT)
         if ((os.contains("mac") || os.contains("darwin")) && parent != null) {
             try {
@@ -434,12 +430,12 @@ object AgentMain {
         )
         val services = ConfigLoader.loadServices(confDir)
         if (services.isEmpty()) {
-            println("No enabled services found in ${confDir.toAbsolutePath()}")
+            log.warn("No enabled services found in {}", confDir.toAbsolutePath())
             telemetry.log("Agent", -301, "No enabled services found.", "WARN")
             telemetry.agentStatus("waiting", "Brak włączonych usług w conf.d — dodaj pliki service.")
             return
         }
-        println("ProperBackup Agent — ${services.size} service(s), buffer: ${global.agent.buffer_url}")
+        log.info("ProperBackup Agent — {} service(s), buffer: {}", services.size, global.agent.buffer_url)
         telemetry.log("Agent", -302, "Starting backup cycle.", meta = mapOf("services" to services.size))
 
         val stateDir = Path.of(global.agent.state_dir)
@@ -448,7 +444,7 @@ object AgentMain {
 
         val bw = global.agent.upload_bandwidth_kbps
         if (bw > 0) {
-            println("Upload throttled to $bw KB/s")
+            log.info("Upload throttled to {} KB/s", bw)
         }
         try {
             BufferUploader(global.agent.buffer_url, token, bw).use { uploader ->
@@ -468,10 +464,10 @@ object AgentMain {
                     }
                 }
                 for (svc in services) {
-                    println("--- Service: ${svc.service}")
+                    log.info("--- Service: {}", svc.service)
                     runService(svc, global, stateDir, password, uploader, dryRun, global.agent.server_id, telemetry)
                 }
-                println("[agent] Notifying buffer: scan-complete")
+                log.info("Notifying buffer: scan-complete")
                 uploader.notifyScanComplete(global.agent.server_id)
             }
         } finally {
@@ -485,7 +481,7 @@ object AgentMain {
             try {
                 runOneBackupCycle(globalYml, confDir, dryRun)
             } catch (e: Exception) {
-                System.err.println("[agent] cykl: ${e.message ?: e}")
+                log.error("Backup cycle error: {}", e.message ?: e)
                 runCatching {
                     val g = ConfigLoader.loadGlobal(globalYml)
                     val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
@@ -556,14 +552,14 @@ object AgentMain {
 
         for (pathStr in svc.paths!!) {
             val root = Path.of(pathStr)
-            println("  Scanning: $root")
+            log.info("Scanning: {}", root)
             telemetry.agentStatus("indexing", "Skan dysku: $pathStr", currentFile = pathStr)
             telemetry.log("Agent", -1000, "Scanning path.", meta = mapOf("service" to svc.service, "path" to pathStr))
 
             val result = try {
                 scanner.scan(root, prevState)
             } catch (e: IOException) {
-                System.err.println("  ABORT: ${e.message}")
+                log.error("Scan ABORT: {}", e.message)
                 telemetry.log("Agent", -1001, "Scan failed: ${e.message}", "ERROR", mapOf("path" to pathStr))
                 throw e
             }
@@ -574,11 +570,11 @@ object AgentMain {
                 totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
             )
 
-            println("  Changed: ${result.changedFiles.size} files, Deleted: ${result.deletedRelativePaths.size} paths")
+            log.info("Changed: {} files, Deleted: {} paths", result.changedFiles.size, result.deletedRelativePaths.size)
 
             if (dryRun) {
-                result.changedFiles.forEach { f -> println("  [DRY] changed: $f") }
-                result.deletedRelativePaths.forEach { d -> println("  [DRY] deleted: $d") }
+                result.changedFiles.forEach { f -> log.info("[DRY] changed: {}", f) }
+                result.deletedRelativePaths.forEach { d -> log.info("[DRY] deleted: {}", d) }
                 filesProcessed += result.currentState.size
                 continue
             }
@@ -603,7 +599,7 @@ object AgentMain {
                 }
                 val idxSnap = uploader.fetchPathsIdxForEmbed(serverId)
                 if (idxSnap.isEmpty()) {
-                    println("  (paths.idx snapshot not embedded — buffer unreachable or empty server_id)")
+                    log.info("paths.idx snapshot not embedded — buffer unreachable or empty server_id")
                 }
                 val tarGz = TarGzPacker.packToBytes(
                     root,
@@ -612,7 +608,7 @@ object AgentMain {
                 )
                 val encrypted = encrypt(password, tarGz)
                 uploader.upload(encrypted, pathId, pathStr, "A", serverId)
-                println("  Uploaded ${encrypted.size} bytes (encrypted) for $pathStr")
+                log.info("Uploaded {} bytes (encrypted) for {}", encrypted.size, pathStr)
                 result.changedFiles.forEach { f ->
                     telemetry.fileState(root.resolve(f).toString(), "current")
                 }
@@ -621,7 +617,7 @@ object AgentMain {
 
             if (result.deletedRelativePaths.isNotEmpty()) {
                 uploader.upload(ByteArray(0), pathId, pathStr, "D", serverId)
-                println("  Uploaded tombstone (D) for $pathStr")
+                log.info("Uploaded tombstone (D) for {}", pathStr)
                 result.deletedRelativePaths.forEach { d ->
                     telemetry.fileState(root.resolve(d).toString(), "deleted")
                 }

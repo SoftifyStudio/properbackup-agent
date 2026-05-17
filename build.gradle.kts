@@ -11,6 +11,8 @@ java {
 
 dependencies {
     implementation(project(":properbackup-shared"))
+    implementation("org.slf4j:slf4j-api:2.0.13")
+    runtimeOnly("org.slf4j:slf4j-simple:2.0.13")
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
 }
