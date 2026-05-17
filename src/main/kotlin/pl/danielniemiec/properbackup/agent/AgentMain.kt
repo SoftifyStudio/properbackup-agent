@@ -446,6 +446,9 @@ object AgentMain {
         if (bw > 0) {
             log.info("Upload throttled to {} KB/s", bw)
         }
+        if (global.agent.io_read_rate_mbps > 0) {
+            log.info("I/O read throttled to {} MB/s, CPU target {}%", global.agent.io_read_rate_mbps, global.agent.max_cpu_percent)
+        }
         try {
             BufferUploader(global.agent.buffer_url, token, bw).use { uploader ->
                 if (!dryRun && global.agent.server_id.isNotBlank()) {
@@ -543,7 +546,11 @@ object AgentMain {
         val allExcludes = ArrayList(global.default_excludes)
         allExcludes.addAll(svc.exclude)
 
-        val scanner = DifferentialScanner(allExcludes)
+        val ioThrottle = pl.danielniemiec.properbackup.agent.throttle.IoThrottle(
+            readRateMbps = global.agent.io_read_rate_mbps,
+            maxCpuPercent = global.agent.max_cpu_percent,
+        )
+        val scanner = DifferentialScanner(allExcludes, ioThrottle)
         val cache = MetadataCache(stateDir, svc.service!!)
         val prevState = cache.load()
 
