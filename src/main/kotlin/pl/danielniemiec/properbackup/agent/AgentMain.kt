@@ -17,6 +17,8 @@ import pl.danielniemiec.properbackup.agent.util.GuiSingletonLock
 import pl.danielniemiec.properbackup.agent.util.JvmLaunch
 import pl.danielniemiec.properbackup.agent.util.MachineIdentity
 import pl.danielniemiec.properbackup.agent.util.StartupTrace
+import pl.danielniemiec.properbackup.agent.recovery.RecoveryExecutor
+import pl.danielniemiec.properbackup.agent.recovery.RecoveryPoller
 import pl.danielniemiec.properbackup.core.codec.ProperCodec
 import pl.danielniemiec.properbackup.core.crypto.ProperCrypto
 import java.awt.GraphicsEnvironment
@@ -479,6 +481,21 @@ object AgentMain {
                 }
             } catch (ignored: Exception) {
             }
+            // Recovery polling: check for pending recovery commands from buffer
+            var recoveryPoller: RecoveryPoller? = null
+            try {
+                val g = ConfigLoader.loadGlobal(globalYml)
+                if (g.agent.server_id.isNotBlank()) {
+                    val tok = resolveEnv(g.agent.upload_token)
+                    val stateDir = Path.of(g.agent.state_dir)
+                    val roots = ConfigLoader.loadServices(confDir)
+                        .flatMap { it.paths ?: emptyList() }
+                    val executor = RecoveryExecutor(g.agent.buffer_url, tok, g.agent.server_id, stateDir, roots)
+                    recoveryPoller = RecoveryPoller(g.agent.buffer_url, tok, g.agent.server_id, executor)
+                }
+            } catch (ignored: Exception) {
+            }
+
             val heartbeatIntervalMs = 10_000L
             var elapsed = 0L
             val totalMs = pauseSec * 1000L
@@ -495,6 +512,8 @@ object AgentMain {
                             metrics.perCoreCpu, metrics.coreCount,
                         )
                     }
+                    // Poll buffer for recovery commands every heartbeat
+                    runCatching { recoveryPoller?.poll() }
                 }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
