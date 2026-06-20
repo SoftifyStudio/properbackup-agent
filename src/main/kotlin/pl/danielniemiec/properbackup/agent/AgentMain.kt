@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.agent
 
+import pl.danielniemiec.properbackup.agent.activation.AccessCodeGenerator
 import pl.danielniemiec.properbackup.agent.activation.ActivationClient
 import pl.danielniemiec.properbackup.agent.activation.GlobalConfigWriter
 import pl.danielniemiec.properbackup.agent.browser.SystemBrowserLauncher
@@ -9,7 +10,11 @@ import pl.danielniemiec.properbackup.agent.config.ServiceConfig
 import pl.danielniemiec.properbackup.agent.packer.TarGzPacker
 import pl.danielniemiec.properbackup.agent.scanner.DifferentialScanner
 import pl.danielniemiec.properbackup.agent.scanner.MetadataCache
+import pl.danielniemiec.properbackup.agent.service.ServiceInstaller
 import pl.danielniemiec.properbackup.agent.transport.BufferUploader
+import pl.danielniemiec.properbackup.agent.transport.HeartbeatClient
+import pl.danielniemiec.properbackup.agent.transport.JwtClient
+import pl.danielniemiec.properbackup.agent.transport.SubscriptionExpiredException
 import pl.danielniemiec.properbackup.agent.logging.RemoteTelemetry
 import pl.danielniemiec.properbackup.agent.ui.AgentPanelUrls
 import pl.danielniemiec.properbackup.agent.util.AgentInstanceLock
@@ -74,6 +79,10 @@ object AgentMain {
         var explicitHeadless = false
         var embeddedPanel = false
         var printPanelUrl = false
+        var installService = false
+        var uninstallService = false
+        var serviceStatus = false
+        var showVersion = false
 
         var i = 0
         while (i < args.size) {
@@ -86,6 +95,10 @@ object AgentMain {
                 "--headless" -> explicitHeadless = true
                 EMBEDDED_PANEL -> embeddedPanel = true
                 PRINT_PANEL_URL -> printPanelUrl = true
+                "--install-service", "install-service" -> installService = true
+                "--uninstall-service", "uninstall-service" -> uninstallService = true
+                "--service-status", "service-status" -> serviceStatus = true
+                "--version" -> showVersion = true
                 "--activate" -> {
                     if (i + 1 < args.size && !args[i + 1].startsWith("--")) {
                         activateToken = args[++i]
@@ -96,6 +109,27 @@ object AgentMain {
                 else -> { /* ignore */ }
             }
             i++
+        }
+
+        // --version: print version and exit
+        if (showVersion) {
+            println("ProperBackup Agent v${agentVersion()}")
+            exitProcess(0)
+        }
+
+        // Service management commands
+        if (installService) {
+            handleInstallService(globalYml, confDir)
+            return
+        }
+        if (uninstallService) {
+            val result = ServiceInstaller.uninstall()
+            println(result.message)
+            exitProcess(if (result.success) 0 else 1)
+        }
+        if (serviceStatus) {
+            println("Service status: ${ServiceInstaller.status()}")
+            exitProcess(0)
         }
 
         if (isExplorerStyleJarLaunch(args) && !explicitHeadless) {
@@ -138,7 +172,7 @@ object AgentMain {
             val global = ConfigLoader.loadGlobal(globalYml)
             val bufferUrl = global.agent.buffer_url.replace("/+$".toRegex(), "")
             val client = ActivationClient(bufferUrl)
-            val result = client.activate(activateToken!!, true)
+            val result = client.activate(activateToken, true)
             GlobalConfigWriter.setServerId(globalYml, result.serverId)
             val panelUrl = AgentPanelUrls.guessPanelFromBuffer(bufferUrl)
             val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
@@ -160,9 +194,18 @@ object AgentMain {
                     ),
                 )
             }
-            println("Otwieranie panelu (zalogowanie z fragmentu URL)…")
+            println("[activation] Opening panel...")
             SystemBrowserLauncher.openUrl(open)
             return
+        }
+
+        // First-run: if server_id is blank, run access code activation flow
+        run {
+            val g = ConfigLoader.loadGlobal(globalYml)
+            if (g.agent.server_id.isBlank()) {
+                runAccessCodeActivation(globalYml, confDir)
+                return
+            }
         }
 
         val lockFile = globalYml.resolveSibling(".agent.lock")
@@ -701,7 +744,6 @@ object AgentMain {
                 if (parts.size < 5) continue
                 val coreIdx = parts[0].removePrefix("cpu").toIntOrNull() ?: continue
                 if (coreIdx >= coreCount) continue
-                // fields: user nice system idle iowait irq softirq steal
                 val vals = parts.drop(1).mapNotNull { it.toLongOrNull() }
                 if (vals.size < 4) continue
                 val idle = vals[3] + (if (vals.size > 4) vals[4] else 0L)
@@ -733,5 +775,129 @@ object AgentMain {
         } catch (_: Exception) {
             return null
         }
+    }
+
+    // ── Service installation ──
+
+    private fun handleInstallService(globalYml: Path, confDir: Path) {
+        val agentBinary = resolveAgentBinary()
+        if (agentBinary == null) {
+            System.err.println("Cannot determine agent binary path.")
+            if (!ServiceInstaller.hasSudo()) {
+                println("\nTo install as a service, run:")
+                println("  sudo properbackup install-service")
+            }
+            exitProcess(1)
+        }
+        val result = ServiceInstaller.install(agentBinary, confDir)
+        println(result.message)
+        if (result.unitPath != null) {
+            println("Service file: ${result.unitPath}")
+        }
+        if (!result.success && result.manualCommand != null) {
+            println("\nManual installation command:")
+            println(result.manualCommand)
+        }
+        exitProcess(if (result.success) 0 else 1)
+    }
+
+    private fun resolveAgentBinary(): Path? {
+        // Prefer the shell launcher from jlinkDist distribution
+        val cwd = Path.of(System.getProperty("user.dir"))
+        val distLauncher = cwd.resolve("properbackup-agent")
+        if (Files.exists(distLauncher) && Files.isExecutable(distLauncher)) return distLauncher
+        // Fall back to the JAR itself
+        val jar = selfJarPath()
+        if (jar.isPresent) return jar.get()
+        return null
+    }
+
+    // ── First-run access code activation ──
+
+    @JvmStatic
+    fun runAccessCodeActivation(globalYml: Path, confDir: Path) {
+        val global = ConfigLoader.loadGlobal(globalYml)
+        val bufferUrl = global.agent.buffer_url.trimEnd('/')
+        if (bufferUrl.isBlank()) {
+            System.err.println("[activation] No buffer_url configured in $globalYml")
+            exitProcess(2)
+        }
+
+        val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
+        val accessCode = AccessCodeGenerator.generate()
+        val formatted = AccessCodeGenerator.formatForDisplay(accessCode)
+
+        println()
+        println("╔══════════════════════════════════════════════╗")
+        println("║        ProperBackup — First Run Setup        ║")
+        println("╠══════════════════════════════════════════════╣")
+        println("║                                              ║")
+        println("║   Your access code:  $formatted         ║")
+        println("║                                              ║")
+        println("║   Enter this code in the ProperBackup web    ║")
+        println("║   panel to link this server.                 ║")
+        println("║                                              ║")
+        println("╚══════════════════════════════════════════════╝")
+        println()
+
+        val client = ActivationClient(bufferUrl)
+        try {
+            client.registerAccessCode(accessCode, machineId)
+        } catch (e: Exception) {
+            System.err.println("[activation] Could not register code with buffer: ${e.message}")
+            println("You can also activate manually: properbackup-agent --activate <TOKEN>")
+            return
+        }
+
+        println("Waiting for activation via web panel...")
+        println("(Press Ctrl+C to cancel)")
+        println()
+
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                Thread.sleep(5_000)
+                val result = client.pollAccessCode(accessCode, machineId)
+                if (result != null) {
+                    GlobalConfigWriter.setServerId(globalYml, result.serverId)
+                    println("[activation] Server activated: ${result.name} (${result.serverId})")
+
+                    if (ServiceInstaller.hasSudo()) {
+                        println("[activation] Installing systemd service...")
+                        val agentBin = resolveAgentBinary()
+                        if (agentBin != null) {
+                            val svcResult = ServiceInstaller.install(agentBin, confDir)
+                            println(svcResult.message)
+                        }
+                    } else {
+                        println()
+                        println("To start ProperBackup as a service:")
+                        println("  sudo properbackup install-service")
+                    }
+                    return
+                }
+                if (attempt % 12 == 0) {
+                    println("Still waiting... code: $formatted")
+                }
+            } catch (e: InterruptedException) {
+                println("\n[activation] Cancelled.")
+                return
+            } catch (e: Exception) {
+                if (attempt % 6 == 0) {
+                    System.err.println("[activation] Poll error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun agentVersion(): String {
+        val props = AgentMain::class.java.getResourceAsStream("/agent-version.properties")
+        if (props != null) {
+            val p = java.util.Properties()
+            p.load(props)
+            return p.getProperty("version", "dev")
+        }
+        return "dev"
     }
 }
