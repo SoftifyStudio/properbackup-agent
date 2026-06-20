@@ -783,10 +783,13 @@ object AgentMain {
     }
 
     private fun resolveAgentBinary(): Path? {
+        // Prefer the shell launcher from jlinkDist distribution
+        val cwd = Path.of(System.getProperty("user.dir"))
+        val distLauncher = cwd.resolve("properbackup-agent")
+        if (Files.exists(distLauncher) && Files.isExecutable(distLauncher)) return distLauncher
+        // Fall back to the JAR itself
         val jar = selfJarPath()
         if (jar.isPresent) return jar.get()
-        val distBin = Path.of(System.getProperty("user.dir"), "properbackup-agent")
-        if (Files.exists(distBin)) return distBin
         return null
     }
 

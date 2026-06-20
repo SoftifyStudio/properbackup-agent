@@ -137,7 +137,7 @@ tasks.register("jlinkDist") {
                 """
                 |#!/bin/sh
                 |SCRIPT_DIR="${'$'}(cd "${'$'}(dirname "${'$'}0")" && pwd)"
-                |exec "${'$'}SCRIPT_DIR/jre/bin/java" -Xmx512m -cp "${'$'}SCRIPT_DIR/lib/*" $mainCls "${'$'}@"
+                |exec "${'$'}SCRIPT_DIR/jre/bin/java" -Djdk.lang.Process.launchMechanism=vfork -Xmx512m -cp "${'$'}SCRIPT_DIR/lib/*" $mainCls "${'$'}@"
                 """.trimMargin()
             )
             setExecutable(true)
