@@ -1,15 +1,19 @@
 package pl.danielniemiec.properbackup.agent
 
+import pl.danielniemiec.properbackup.agent.activation.AccessCodeGenerator
 import pl.danielniemiec.properbackup.agent.activation.ActivationClient
 import pl.danielniemiec.properbackup.agent.activation.GlobalConfigWriter
 import pl.danielniemiec.properbackup.agent.browser.SystemBrowserLauncher
 import pl.danielniemiec.properbackup.agent.config.ConfigLoader
 import pl.danielniemiec.properbackup.agent.config.GlobalConfig
 import pl.danielniemiec.properbackup.agent.config.ServiceConfig
+import pl.danielniemiec.properbackup.agent.host.SystemdInstaller
+import pl.danielniemiec.properbackup.agent.host.VpsHostAdapter
 import pl.danielniemiec.properbackup.agent.packer.TarGzPacker
 import pl.danielniemiec.properbackup.agent.scanner.DifferentialScanner
 import pl.danielniemiec.properbackup.agent.scanner.MetadataCache
 import pl.danielniemiec.properbackup.agent.transport.BufferUploader
+import pl.danielniemiec.properbackup.agent.transport.HeartbeatClient
 import pl.danielniemiec.properbackup.agent.logging.RemoteTelemetry
 import pl.danielniemiec.properbackup.agent.ui.AgentPanelUrls
 import pl.danielniemiec.properbackup.agent.util.AgentInstanceLock
@@ -453,56 +457,100 @@ object AgentMain {
     }
 
     private fun runAgentLoop(globalYml: Path, confDir: Path, dryRun: Boolean) {
-        while (!Thread.currentThread().isInterrupted) {
-            try {
-                runOneBackupCycle(globalYml, confDir, dryRun)
-            } catch (e: Exception) {
-                System.err.println("[agent] cykl: ${e.message ?: e}")
-                runCatching {
-                    val g = ConfigLoader.loadGlobal(globalYml)
-                    val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
-                    RemoteTelemetry(g, machineId).log("Agent", -500, "Cycle error: ${e.message ?: e}", "ERROR")
-                }
+        showFirstRunAccessCodeIfNeeded(globalYml)
+        trySystemdInstall(globalYml, confDir)
+
+        var heartbeat: HeartbeatClient? = null
+        try {
+            val g = ConfigLoader.loadGlobal(globalYml)
+            if (g.agent.server_id.isNotBlank()) {
+                val tok = resolveEnv(g.agent.upload_token)
+                heartbeat = HeartbeatClient(
+                    g.agent.buffer_url.replace("/+$".toRegex(), ""),
+                    g.agent.server_id,
+                ) { tok }
+                heartbeat.start()
+                println("[agent] heartbeat started (every 60s)")
             }
-            // Continuous scanning: short pause (5s default) between cycles instead of 60s idle.
-            // Configurable via PROPERBACKUP_POLL_INTERVAL; minimum is 5s.
-            var pauseSec = 5
-            var metricsUploader: BufferUploader? = null
-            var metricsServerId = ""
-            try {
-                val g = ConfigLoader.loadGlobal(globalYml)
-                pauseSec = maxOf(5, g.agent.poll_interval_seconds)
-                if (g.agent.server_id.isNotBlank()) {
-                    val tok = resolveEnv(g.agent.upload_token)
-                    metricsUploader = BufferUploader(g.agent.buffer_url, tok)
-                    metricsServerId = g.agent.server_id
-                }
-            } catch (ignored: Exception) {
-            }
-            val heartbeatIntervalMs = 10_000L
-            var elapsed = 0L
-            val totalMs = pauseSec * 1000L
-            try {
-                while (elapsed < totalMs && !Thread.currentThread().isInterrupted) {
-                    val sleepChunk = minOf(heartbeatIntervalMs, totalMs - elapsed)
-                    Thread.sleep(sleepChunk)
-                    elapsed += sleepChunk
+        } catch (e: Exception) {
+            System.err.println("[agent] heartbeat init failed: ${e.message}")
+        }
+
+        try {
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    runOneBackupCycle(globalYml, confDir, dryRun)
+                } catch (e: Exception) {
+                    System.err.println("[agent] cykl: ${e.message ?: e}")
                     runCatching {
-                        val metrics = collectMetrics()
-                        metricsUploader?.reportMetrics(
-                            metricsServerId,
-                            metrics.cpuPercent, metrics.ramUsedMb, metrics.ramTotalMb,
-                            metrics.perCoreCpu, metrics.coreCount,
-                        )
+                        val g = ConfigLoader.loadGlobal(globalYml)
+                        val machineId = MachineIdentity.getOrCreate(MachineIdentity.defaultDeviceIdFile(globalYml))
+                        RemoteTelemetry(g, machineId).log("Agent", -500, "Cycle error: ${e.message ?: e}", "ERROR")
                     }
                 }
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                break
-            } finally {
-                runCatching { metricsUploader?.close() }
+                var pauseSec = 5
+                var metricsUploader: BufferUploader? = null
+                var metricsServerId = ""
+                try {
+                    val g = ConfigLoader.loadGlobal(globalYml)
+                    pauseSec = maxOf(5, g.agent.poll_interval_seconds)
+                    if (g.agent.server_id.isNotBlank()) {
+                        val tok = resolveEnv(g.agent.upload_token)
+                        metricsUploader = BufferUploader(g.agent.buffer_url, tok)
+                        metricsServerId = g.agent.server_id
+                    }
+                } catch (ignored: Exception) {
+                }
+                val metricsIntervalMs = 10_000L
+                var elapsed = 0L
+                val totalMs = pauseSec * 1000L
+                try {
+                    while (elapsed < totalMs && !Thread.currentThread().isInterrupted) {
+                        val sleepChunk = minOf(metricsIntervalMs, totalMs - elapsed)
+                        Thread.sleep(sleepChunk)
+                        elapsed += sleepChunk
+                        runCatching {
+                            val metrics = collectMetrics()
+                            metricsUploader?.reportMetrics(
+                                metricsServerId,
+                                metrics.cpuPercent, metrics.ramUsedMb, metrics.ramTotalMb,
+                                metrics.perCoreCpu, metrics.coreCount,
+                            )
+                        }
+                    }
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                } finally {
+                    runCatching { metricsUploader?.close() }
+                }
             }
+        } finally {
+            runCatching { heartbeat?.close() }
         }
+    }
+
+    private fun showFirstRunAccessCodeIfNeeded(globalYml: Path) {
+        val global = try { ConfigLoader.loadGlobal(globalYml) } catch (_: Exception) { GlobalConfig() }
+        if (global.agent.server_id.isNotBlank()) return
+
+        val code = AccessCodeGenerator.generate()
+        val formatted = AccessCodeGenerator.format(code)
+        println()
+        println("====================================================")
+        println("  ProperBackup Agent — First Run")
+        println("  ACCESS CODE: $formatted")
+        println("  Enter this code in the web panel to link this agent.")
+        println("====================================================")
+        println()
+    }
+
+    private fun trySystemdInstall(globalYml: Path, confDir: Path) {
+        if (SystemdInstaller.isInstalled()) return
+        val agentBin = globalYml.parent?.parent?.resolve("properbackup-agent")
+            ?: return
+        if (!Files.exists(agentBin)) return
+        SystemdInstaller.tryInstallOrPrintInstructions(agentBin, confDir)
     }
 
     @Throws(Exception::class)

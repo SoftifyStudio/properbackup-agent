@@ -11,6 +11,7 @@ java {
 }
 
 dependencies {
+    implementation("org.jetbrains.kotlin:kotlin-stdlib")
     implementation(project(":properbackup-shared"))
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
@@ -108,5 +109,93 @@ tasks.register<Exec>("jpackageMacAgentApp") {
             "--main-class", mainCls,
             "--dest", dest.absolutePath,
         )
+    }
+}
+
+/**
+ * jlinkDist: build a self-contained distribution with portable JRE (jlink) + agent.
+ * Result: build/jlink-dist/properbackup-agent-<version>.tar.gz (<70MB target).
+ */
+tasks.register("jlinkDist") {
+    group = "distribution"
+    description = "Build self-contained tar.gz with portable JRE (jlink) + agent JAR. No system Java needed."
+    dependsOn(tasks.named("shadowJar"))
+
+    doLast {
+        val shadowJarFile = tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar")
+            .get().archiveFile.get().asFile
+        val jlinkDir = layout.buildDirectory.dir("jlink-dist").get().asFile
+        val imageDir = File(jlinkDir, "properbackup-agent")
+        if (imageDir.exists()) imageDir.deleteRecursively()
+        jlinkDir.mkdirs()
+
+        val javaHome = System.getProperty("java.home") ?: error("java.home not set")
+        val jlinkBin = File(javaHome, "bin/jlink").absolutePath
+        val jmodDir = File(javaHome, "jmods")
+        if (!jmodDir.exists()) error("jmods directory not found at $jmodDir — need a full JDK, not a JRE")
+
+        val modules = listOf(
+            "java.base",
+            "java.logging",
+            "java.net.http",
+            "java.management",
+            "java.desktop",
+            "java.naming",
+            "java.sql",
+            "jdk.unsupported",
+            "jdk.crypto.ec",
+        )
+
+        val jlinkResult = exec {
+            commandLine(
+                jlinkBin,
+                "--add-modules", modules.joinToString(","),
+                "--strip-debug",
+                "--no-man-pages",
+                "--no-header-files",
+                "--compress=zip-6",
+                "--output", File(imageDir, "jre").absolutePath,
+            )
+            isIgnoreExitValue = true
+        }
+        if (jlinkResult.exitValue != 0) error("jlink failed with exit code ${jlinkResult.exitValue}")
+
+        val libDir = File(imageDir, "lib")
+        libDir.mkdirs()
+        shadowJarFile.copyTo(File(libDir, "properbackup-agent.jar"), overwrite = true)
+
+        val launcherScript = File(imageDir, "properbackup-agent")
+        launcherScript.writeText(
+            """
+            |#!/bin/sh
+            |SCRIPT_DIR="$(cd "$(dirname "${'$'}0")" && pwd)"
+            |JAVA_BIN="${'$'}SCRIPT_DIR/jre/bin/java"
+            |exec "${'$'}JAVA_BIN" -Djava.awt.headless=true \
+            |  -jar "${'$'}SCRIPT_DIR/lib/properbackup-agent.jar" \
+            |  --headless "${'$'}@"
+            """.trimMargin()
+        )
+        launcherScript.setExecutable(true)
+
+        val installScript = File(imageDir, "install-service.sh")
+        val serviceScriptSrc = file("scripts/install-service.sh")
+        if (serviceScriptSrc.exists()) {
+            serviceScriptSrc.copyTo(installScript, overwrite = true)
+        } else {
+            installScript.writeText("#!/bin/sh\necho 'install-service.sh not bundled'\nexit 1\n")
+        }
+        installScript.setExecutable(true)
+
+        val tarFile = File(jlinkDir, "properbackup-agent.tar.gz")
+        exec {
+            workingDir = jlinkDir
+            commandLine("tar", "czf", tarFile.absolutePath, "properbackup-agent")
+        }
+
+        val sizeMb = tarFile.length() / (1024.0 * 1024.0)
+        println("jlinkDist: ${tarFile.absolutePath} (${String.format("%.1f", sizeMb)} MB)")
+        if (sizeMb > 70) {
+            logger.warn("WARNING: tar.gz is ${String.format("%.1f", sizeMb)} MB — exceeds 70MB target!")
+        }
     }
 }
