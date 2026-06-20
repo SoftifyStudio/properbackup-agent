@@ -1,7 +1,6 @@
 plugins {
     kotlin("jvm")
     application
-    id("com.github.johnrengelman.shadow") version "8.1.1"
 }
 
 java {
@@ -77,6 +76,92 @@ tasks.register<Exec>("properbackupDesktopRunWebDev") {
 tasks.jar {
     manifest {
         attributes("Main-Class" to "pl.danielniemiec.properbackup.agent.AgentMain")
+    }
+}
+
+/**
+ * Bundled JRE distribution — produces a self-contained archive with a minimal JRE
+ * so end users don't need to install Java. Output: build/properbackup-agent-dist/
+ *
+ * Usage after extraction:  ./properbackup-agent --activate TOKEN
+ */
+tasks.register("jlinkDist") {
+    group = "distribution"
+    description = "Build a self-contained distribution with bundled minimal JRE (jlink)."
+    dependsOn(tasks.named("installDist"))
+
+    val distDir = layout.buildDirectory.dir("properbackup-agent-dist").get().asFile
+    val jlinkDir = layout.buildDirectory.dir("jlink-jre").get().asFile
+    val modules = "java.base,java.desktop,java.net.http,java.sql,jdk.management,jdk.unsupported"
+
+    doLast {
+        if (distDir.exists()) distDir.deleteRecursively()
+        if (jlinkDir.exists()) jlinkDir.deleteRecursively()
+
+        val javaHome = System.getProperty("java.home")
+        val jlinkBin = file("$javaHome/bin/jlink")
+        if (!jlinkBin.exists()) {
+            throw GradleException("jlink not found at $jlinkBin — requires JDK (not JRE)")
+        }
+
+        exec {
+            commandLine(
+                jlinkBin.absolutePath,
+                "--add-modules", modules,
+                "--strip-debug",
+                "--no-man-pages",
+                "--no-header-files",
+                "--compress", "zip-6",
+                "--output", jlinkDir.absolutePath,
+            )
+        }
+
+        distDir.mkdirs()
+        val libDir = distDir.resolve("lib")
+        libDir.mkdirs()
+
+        @Suppress("DEPRECATION")
+        val installDir = tasks.named<org.gradle.api.tasks.Sync>("installDist").get().destinationDir
+        installDir.resolve("lib").listFiles()?.forEach { jar ->
+            jar.copyTo(libDir.resolve(jar.name))
+        }
+
+        jlinkDir.copyRecursively(distDir.resolve("jre"))
+        distDir.resolve("jre/bin").listFiles()?.forEach { it.setExecutable(true) }
+
+        val mainCls = application.mainClass.get()
+
+        // Unix launcher
+        distDir.resolve("properbackup-agent").apply {
+            writeText(
+                """
+                |#!/bin/sh
+                |SCRIPT_DIR="${'$'}(cd "${'$'}(dirname "${'$'}0")" && pwd)"
+                |exec "${'$'}SCRIPT_DIR/jre/bin/java" -Xmx512m -cp "${'$'}SCRIPT_DIR/lib/*" $mainCls "${'$'}@"
+                """.trimMargin()
+            )
+            setExecutable(true)
+        }
+
+        // Windows launcher
+        distDir.resolve("properbackup-agent.bat").writeText(
+            """
+            |@echo off
+            |set SCRIPT_DIR=%~dp0
+            |"%SCRIPT_DIR%jre\bin\java.exe" -Xmx512m -cp "%SCRIPT_DIR%lib\*" $mainCls %*
+            """.trimMargin()
+        )
+
+        // tar.gz archive for Linux
+        exec {
+            workingDir = distDir.parentFile
+            commandLine("tar", "czf", "properbackup-agent-linux-amd64.tar.gz", "-C", distDir.parentFile.absolutePath, distDir.name)
+        }
+
+        println("Distribution built: ${distDir.absolutePath}")
+        println("  Unix:    ./properbackup-agent --activate <TOKEN>")
+        println("  Windows: properbackup-agent.bat --activate <TOKEN>")
+        println("  Archive: ${distDir.parentFile.resolve("properbackup-agent-linux-amd64.tar.gz")}")
     }
 }
 
