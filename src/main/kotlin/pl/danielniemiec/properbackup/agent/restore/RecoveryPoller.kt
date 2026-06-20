@@ -2,6 +2,7 @@ package pl.danielniemiec.properbackup.agent.restore
 
 import pl.danielniemiec.properbackup.agent.config.GlobalConfig
 import pl.danielniemiec.properbackup.agent.logging.RemoteTelemetry
+import java.nio.file.Path
 
 /**
  * Polls the buffer for recovery commands during backup cycles.
@@ -12,9 +13,10 @@ class RecoveryPoller(
     private val serverId: String,
     private val token: String,
     private val telemetry: RemoteTelemetry,
+    confDir: Path = Path.of("conf.d"),
 ) {
 
-    private val handler = RecoveryCommandHandler(global, serverId, token, telemetry)
+    private val handler = RecoveryCommandHandler(global, serverId, token, telemetry, confDir)
 
     fun pollAndHandle(): Boolean {
         if (serverId.isBlank()) return false
