@@ -167,6 +167,7 @@ object AgentMain {
         val lockFile = globalYml.resolveSibling(".agent.lock")
         AgentInstanceLock.tryAcquire(lockFile)?.use {
             if (once) {
+                pollAndExecuteRecovery(globalYml, confDir)
                 runOneBackupCycle(globalYml, confDir, dryRun)
                 println("Agent run complete.")
             } else {
@@ -635,6 +636,8 @@ object AgentMain {
         val services = try { ConfigLoader.loadServices(confDir) } catch (_: Exception) { emptyList() }
         val backupRoots = services.flatMap { it.paths ?: emptyList() }
 
+        val jwtToken = resolveEnv(global.agent.jwt_token)
+
         val orchestrator = RestoreOrchestrator(
             bufferUrl = global.agent.buffer_url.replace("/+$".toRegex(), ""),
             serverId = global.agent.server_id,
@@ -643,6 +646,7 @@ object AgentMain {
             stateDir = stateDir,
             configDir = configDir,
             backupRoots = backupRoots,
+            jwtToken = jwtToken,
         )
 
         val cmd = orchestrator.pollForCommand() ?: return
