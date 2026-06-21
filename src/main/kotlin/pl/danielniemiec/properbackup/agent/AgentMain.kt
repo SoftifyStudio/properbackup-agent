@@ -18,6 +18,7 @@ import pl.danielniemiec.properbackup.agent.util.JvmLaunch
 import pl.danielniemiec.properbackup.agent.util.MachineIdentity
 import pl.danielniemiec.properbackup.agent.util.StartupTrace
 import pl.danielniemiec.properbackup.core.codec.ProperCodec
+import pl.danielniemiec.properbackup.agent.restore.RestoreOrchestrator
 import pl.danielniemiec.properbackup.core.crypto.ProperCrypto
 import java.awt.GraphicsEnvironment
 import java.io.ByteArrayInputStream
@@ -455,6 +456,11 @@ object AgentMain {
     private fun runAgentLoop(globalYml: Path, confDir: Path, dryRun: Boolean) {
         while (!Thread.currentThread().isInterrupted) {
             try {
+                pollAndExecuteRecovery(globalYml, confDir)
+            } catch (e: Exception) {
+                System.err.println("[agent] recovery poll: ${e.message ?: e}")
+            }
+            try {
                 runOneBackupCycle(globalYml, confDir, dryRun)
             } catch (e: Exception) {
                 System.err.println("[agent] cykl: ${e.message ?: e}")
@@ -615,6 +621,33 @@ object AgentMain {
                 totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
             )
         }
+    }
+
+    private fun pollAndExecuteRecovery(globalYml: Path, confDir: Path) {
+        val global = try { ConfigLoader.loadGlobal(globalYml) } catch (_: Exception) { return }
+        if (global.agent.server_id.isBlank() || global.agent.buffer_url.isBlank()) return
+
+        val token = resolveEnv(global.agent.upload_token)
+        val password = resolveEnv(global.agent.encryption_password)
+        val stateDir = Path.of(global.agent.state_dir)
+        val configDir = globalYml.parent ?: Path.of("conf.d")
+
+        val services = try { ConfigLoader.loadServices(confDir) } catch (_: Exception) { emptyList() }
+        val backupRoots = services.flatMap { it.paths ?: emptyList() }
+
+        val orchestrator = RestoreOrchestrator(
+            bufferUrl = global.agent.buffer_url.replace("/+$".toRegex(), ""),
+            serverId = global.agent.server_id,
+            token = token,
+            encryptionPassword = password,
+            stateDir = stateDir,
+            configDir = configDir,
+            backupRoots = backupRoots,
+        )
+
+        val cmd = orchestrator.pollForCommand() ?: return
+        println("[agent] Recovery command received: ${cmd.command} session=${cmd.sessionId}")
+        orchestrator.executeCommand(cmd)
     }
 
     @Throws(Exception::class)
