@@ -22,6 +22,7 @@ import pl.danielniemiec.properbackup.agent.util.JvmLaunch
 import pl.danielniemiec.properbackup.agent.util.MachineIdentity
 import pl.danielniemiec.properbackup.agent.util.StartupTrace
 import pl.danielniemiec.properbackup.core.codec.ProperCodec
+import pl.danielniemiec.properbackup.agent.restore.RestoreOrchestrator
 import pl.danielniemiec.properbackup.core.crypto.ProperCrypto
 import java.awt.GraphicsEnvironment
 import java.io.ByteArrayInputStream
@@ -170,6 +171,7 @@ object AgentMain {
         val lockFile = globalYml.resolveSibling(".agent.lock")
         AgentInstanceLock.tryAcquire(lockFile)?.use {
             if (once) {
+                pollAndExecuteRecovery(globalYml, confDir)
                 runOneBackupCycle(globalYml, confDir, dryRun)
                 println("Agent run complete.")
             } else {
@@ -479,6 +481,11 @@ object AgentMain {
         try {
             while (!Thread.currentThread().isInterrupted) {
                 try {
+                    pollAndExecuteRecovery(globalYml, confDir)
+                } catch (e: Exception) {
+                    System.err.println("[agent] recovery poll: ${e.message ?: e}")
+                }
+                try {
                     runOneBackupCycle(globalYml, confDir, dryRun)
                 } catch (e: Exception) {
                     System.err.println("[agent] cykl: ${e.message ?: e}")
@@ -663,6 +670,50 @@ object AgentMain {
                 totalFiles = totalFilesDiscovered, scannedFiles = filesProcessed,
             )
         }
+    }
+
+    private fun pollAndExecuteRecovery(globalYml: Path, confDir: Path) {
+        println("[agent] Polling for recovery commands...")
+        val global = try {
+            ConfigLoader.loadGlobal(globalYml)
+        } catch (e: Exception) {
+            System.err.println("[agent] Failed to load config: ${e.message}")
+            return
+        }
+        if (global.agent.server_id.isBlank() || global.agent.buffer_url.isBlank()) {
+            println("[agent] server_id or buffer_url blank, skipping recovery poll")
+            return
+        }
+
+        val token = resolveEnv(global.agent.upload_token)
+        val password = resolveEnv(global.agent.encryption_password)
+        val stateDir = Path.of(global.agent.state_dir)
+        val configDir = globalYml.parent ?: Path.of("conf.d")
+
+        val services = try { ConfigLoader.loadServices(confDir) } catch (_: Exception) { emptyList() }
+        val backupRoots = services.flatMap { it.paths ?: emptyList() }
+        println("[agent] Recovery poll: bufferUrl=${global.agent.buffer_url}, serverId=${global.agent.server_id}, backupRoots=$backupRoots")
+
+        val jwtToken = resolveEnv(global.agent.jwt_token)
+
+        val orchestrator = RestoreOrchestrator(
+            bufferUrl = global.agent.buffer_url.replace("/+$".toRegex(), ""),
+            serverId = global.agent.server_id,
+            token = token,
+            encryptionPassword = password,
+            stateDir = stateDir,
+            configDir = configDir,
+            backupRoots = backupRoots,
+            jwtToken = jwtToken,
+        )
+
+        val cmd = orchestrator.pollForCommand()
+        if (cmd == null) {
+            println("[agent] No recovery commands pending")
+            return
+        }
+        println("[agent] Recovery command received: ${cmd.command} session=${cmd.sessionId}")
+        orchestrator.executeCommand(cmd)
     }
 
     @Throws(Exception::class)
